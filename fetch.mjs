@@ -214,24 +214,39 @@ async function fetchPNJGoldBrands() {
   return items;
 }
 
+// btmc.vn itself 520/522's from the shared Cloudflare egress range but is
+// fine from a GitHub Actions runner — however its own chart page prices
+// per-chỉ, not per-lượng like every other dealer here. giavang.org mirrors
+// BTMC's counter prices per-lượng (states "Đơn vị: x1000đ/lượng" on-page),
+// grouped under a "Thương phẩm" heading (VRTL / Quà Mừng Vàng / Vàng SJC /
+// Vàng BTMC / Vàng Thị Trường) that repeats via rowspan — carry it forward
+// as a prefix so ids stay unique and readable.
 async function fetchBTMCGoldBrands() {
-  const html = await fetchHTML("https://btmc.vn/bieu-do-gia-vang.html?t=ngay");
-  const marker = html.indexOf("bd_price_home");
-  if (marker === -1) return [];
-  const priceTableHTML = html.slice(marker);
+  const html = await fetchHTML("https://giavang.org/trong-nuoc/bao-tin-minh-chau/");
   const items = [];
-  for (const row of scraper.rows(priceTableHTML)) {
-    if (row.cells.length !== 4) continue;
-    const name = row.cells[0];
-    if (isExcludedGoldProduct(btmcGoldBrandSlug, name)) continue;
-    const buyRaw = scraper.price(row.cells[2]);
-    const sellRaw = scraper.price(row.cells[3]);
-    if (buyRaw === null || sellRaw === null || !(buyRaw > 0)) continue;
+  let currentCategory = "";
+  for (const row of scraper.rows(html)) {
+    let productName, buyCell, sellCell;
+    if (row.cells.length === 4) {
+      [currentCategory, productName, buyCell, sellCell] = row.cells;
+    } else if (row.cells.length === 3) {
+      [productName, buyCell, sellCell] = row.cells;
+    } else {
+      continue;
+    }
+    // "Vàng SJC" counter price at BTMC just mirrors SJC's own dealer price —
+    // already counted under the SJC fetcher, so skip it here.
+    if (normalize(currentCategory).includes("vang sjc")) continue;
+
+    const buy = scraper.price(buyCell);
+    const sell = scraper.price(sellCell);
+    if (buy === null || sell === null || !(buy > 0)) continue;
+    const name = `${currentCategory} - ${productName}`;
     items.push({
       id: typeCode(btmcGoldBrandSlug, name),
       name,
-      buy: buyRaw * 1000,
-      sell: sellRaw * 1000,
+      buy: buy * 1000,
+      sell: sell * 1000,
       currency: "VND",
       brand: "Bảo Tín Minh Châu",
     });
@@ -604,14 +619,15 @@ async function fetchBaoTinManhHaiSilverBrands() {
   return result;
 }
 
+// Also lists Phú Quý's and Ancarat's own silver sold at BTMC's counter —
+// keep only the "Rồng Thăng Long" rows (BTMC's own brand) to avoid double-
+// counting those dealers' prices, which are already fetched from their own
+// sources above.
 async function fetchBTMCSilverBrands() {
-  const html = await fetchHTML("https://btmc.vn/gia-bac-theo-ngay.html");
-  const marker = html.indexOf("bd_price_home");
-  if (marker === -1) return [];
-  const priceTableHTML = html.slice(marker);
+  const html = await fetchHTML("https://btmc.vn/Home/BGiaBac");
   const items = [];
-  for (const row of scraper.rows(priceTableHTML)) {
-    if (row.cells.length !== 4) continue;
+  for (const row of scraper.rows(html)) {
+    if (row.cells.length !== 3) continue;
     const name = row.cells[0];
     if (!normalize(name).includes("rong thang long")) continue;
     const rawBuy = Number(row.cells[1].trim());
