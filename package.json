@@ -1,0 +1,8 @@
+{
+  "name": "pocketlog-price-feed",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  }
+}
