@@ -439,7 +439,6 @@ const dojiSilverBrandSlug = "doji";
 const phuQuySilverBrandSlug = "phuquy";
 const ancaratSilverBrandSlug = "ancarat";
 const baoTinManhHaiSilverBrandSlug = "baotinmanhhai";
-const btmcSilverBrandSlug = "btmc";
 const kimNganPhucSilverBrandSlug = "kimnganphuc";
 
 async function fetchDojiSilverBrands() {
@@ -619,43 +618,6 @@ async function fetchBaoTinManhHaiSilverBrands() {
   return result;
 }
 
-// Also lists Phú Quý's and Ancarat's own silver sold at BTMC's counter —
-// keep only the "Rồng Thăng Long" rows (BTMC's own brand) to avoid double-
-// counting those dealers' prices, which are already fetched from their own
-// sources above.
-async function fetchBTMCSilverBrands() {
-  const html = await fetchHTML("https://btmc.vn/Home/BGiaBac");
-  const items = [];
-  for (const row of scraper.rows(html)) {
-    if (row.cells.length !== 3) continue;
-    const name = row.cells[0];
-    if (!normalize(name).includes("rong thang long")) continue;
-    const rawBuy = Number(row.cells[1].trim());
-    const rawSell = Number(row.cells[2].trim());
-    if (Number.isNaN(rawBuy) || Number.isNaN(rawSell) || !(rawBuy > 0)) continue;
-    const unitLuong = silverLuongPerUnit(name);
-    if (!unitLuong) {
-      logRejected("BTMC", name, "không đọc được khối lượng trong tên");
-      continue;
-    }
-    const buy = (rawBuy * 1000) / unitLuong;
-    const sell = (rawSell * 1000) / unitLuong;
-    if (!isPlausible(buy)) {
-      logRejected("BTMC", name, `giá/lượng ${Math.round(buy)} ngoài dải hợp lý`);
-      continue;
-    }
-    items.push({
-      id: typeCode(btmcSilverBrandSlug, name),
-      name,
-      buy: Math.round(buy),
-      sell: Math.round(sell),
-      brand: "Bảo Tín Minh Châu",
-      packaging: packagingLabel(name),
-    });
-  }
-  return items;
-}
-
 async function fetchKimNganPhucSilverBrands() {
   const rows = await fetchKimNganPhucRows("https://kimnganphuc.vn/gia-vang");
   const raw = walkKimNganPhucRows(rows, { keepSilver: true });
@@ -690,7 +652,6 @@ async function fetchSilverBrands() {
     fetchPhuQuySilverBrands,
     fetchAncaratSilverBrands,
     fetchBaoTinManhHaiSilverBrands,
-    fetchBTMCSilverBrands,
     fetchKimNganPhucSilverBrands,
   ];
   const results = await Promise.allSettled(fetchers.map((fn) => fn()));
