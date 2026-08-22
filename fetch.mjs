@@ -802,8 +802,9 @@ async function readKV(key) {
   return res.json();
 }
 
-async function writeKV(key, value) {
-  const res = await fetch(kvUrl(key), {
+async function writeKV(key, value, { expirationTtl } = {}) {
+  const url = expirationTtl ? `${kvUrl(key)}?expiration_ttl=${expirationTtl}` : kvUrl(key);
+  const res = await fetch(url, {
     method: "PUT",
     headers: { Authorization: `Bearer ${CF_API_TOKEN}`, "Content-Type": "text/plain" },
     body: JSON.stringify(value),
@@ -816,6 +817,123 @@ function mergeById(previousItems, freshItems) {
   const merged = new Map((previousItems ?? []).map((item) => [item.id, item]));
   for (const item of freshItems) merged.set(item.id, item);
   return [...merged.values()];
+}
+
+// ---------------------------------------------------------------------------
+// Lịch sử giá (cho biểu đồ trong app)
+//
+// Key `data` ở trên chỉ là snapshot mới nhất, bị ghi đè mỗi lần chạy — không đủ để
+// vẽ chart. Nên có thêm hai tầng, cả hai đều là key RIÊNG: bản app đang phát hành
+// chỉ đọc `data`, nên không bao giờ thấy các key này.
+//
+//   intraday:<metal>:<YYYY-MM-DD>  mẫu ~15 phút, TTL 30 ngày  -> phục vụ nến 1h/4h
+//   history:<metal>                giá đóng mỗi ngày, 1500 mốc -> phục vụ 1d/1w/1m
+//
+// Cả hai lưu dạng cột (`t` + `series[id].buy/sell`) thay vì mảng object: 110 mã vàng
+// × 1500 ngày mà lưu object thì blob phình lên hàng chục MB, chạm giới hạn 25MB/value.
+
+const SCALE = 1000;
+const DAILY_MAX_POINTS = 1500;
+const INTRADAY_MIN_GAP_MS = 15 * 60 * 1000;
+const INTRADAY_TTL_SECONDS = 30 * 86400;
+
+// Giá vàng/bạc là chuyện của thị trường VN, nên mốc ngày phải theo giờ VN chứ không
+// phải UTC — runner của GitHub Actions chạy ở UTC, lệch 7 tiếng.
+const vnDateFormatter = new Intl.DateTimeFormat("en-CA", {
+  timeZone: "Asia/Ho_Chi_Minh",
+  year: "numeric",
+  month: "2-digit",
+  day: "2-digit",
+});
+
+/** `YYYY-MM-DD` theo giờ Asia/Ho_Chi_Minh. */
+function vnDate(date) {
+  return vnDateFormatter.format(date);
+}
+
+function emptyStore() {
+  return { v: 1, scale: SCALE, t: [], series: {} };
+}
+
+/**
+ * Thêm một mốc vào cuối chuỗi cột. Mã mới xuất hiện giữa đường được pad `null` cho
+ * toàn bộ mốc trước đó, mã lần này thiếu cũng pad `null` — nhờ vậy mọi mảng luôn
+ * dài bằng `t`, và app chỉ cần zip theo index.
+ *
+ * `sell: 0` là sentinel "dealer không công bố giá bán" (xem các scraper ở trên) nên
+ * phải giữ nguyên số 0, KHÔNG được quy về `null` — hai thứ này khác nghĩa.
+ */
+function appendSnapshot(store, stamp, items) {
+  const index = store.t.length;
+  store.t.push(stamp);
+
+  for (const item of items) {
+    let entry = store.series[item.id];
+    if (!entry) {
+      entry = { buy: [], sell: [] };
+      store.series[item.id] = entry;
+    }
+    while (entry.buy.length < index) {
+      entry.buy.push(null);
+      entry.sell.push(null);
+    }
+    entry.buy.push(Math.round(item.buy / SCALE));
+    entry.sell.push(Math.round(item.sell / SCALE));
+  }
+
+  for (const entry of Object.values(store.series)) {
+    while (entry.buy.length <= index) {
+      entry.buy.push(null);
+      entry.sell.push(null);
+    }
+  }
+
+  return store;
+}
+
+/** Cắt cửa sổ trượt, và bỏ hẳn mã đã rỗng sạch sau khi cắt (dealer ngừng bán). */
+function trimStore(store, maxPoints) {
+  const excess = store.t.length - maxPoints;
+  if (excess <= 0) return store;
+
+  store.t = store.t.slice(excess);
+  for (const [id, entry] of Object.entries(store.series)) {
+    entry.buy = entry.buy.slice(excess);
+    entry.sell = entry.sell.slice(excess);
+    if (entry.buy.every((value) => value === null)) delete store.series[id];
+  }
+  return store;
+}
+
+/**
+ * Một điểm intraday mỗi ~15 phút. Cái gate này là điểm chốt chi phí: gói KV free cho
+ * 1000 writes/ngày, nếu append mỗi lần cron thì tần suất cron quyết định hạn mức
+ * (cron 5 phút -> 576 writes chỉ riêng intraday). Có gate thì trần là 96
+ * writes/metal/ngày bất kể cron dày cỡ nào.
+ */
+async function appendIntraday(metal, items, dayKey, nowMs) {
+  const key = `intraday:${metal}:${dayKey}`;
+  const store = (await readKV(key)) ?? emptyStore();
+  const last = store.t[store.t.length - 1];
+  if (last != null && nowMs - last * 1000 < INTRADAY_MIN_GAP_MS) return false;
+
+  appendSnapshot(store, Math.floor(nowMs / 1000), items);
+  // TTL thay cho việc xoá tay: key hết hạn tự động, không tốn write nào để dọn.
+  await writeKV(key, store, { expirationTtl: INTRADAY_TTL_SECONDS });
+  return true;
+}
+
+/** Một điểm mỗi ngày, ghi ở lần chạy đầu tiên sau khi ngày VN đổi -> 1 write/ngày. */
+async function appendDaily(metal, items, dayKey) {
+  const key = `history:${metal}`;
+  const store = (await readKV(key)) ?? { ...emptyStore(), lastDate: null };
+  if (store.lastDate === dayKey) return false;
+
+  appendSnapshot(store, dayKey, items);
+  store.lastDate = dayKey;
+  trimStore(store, DAILY_MAX_POINTS);
+  await writeKV(key, store);
+  return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -871,6 +989,29 @@ async function main() {
   console.log(
     `Wrote KV — ${mergedGold.length} gold, ${mergedSilver.length} silver, world=${worldPrices ? "ok" : "missing"}`
   );
+
+  // Sau `data`, và trong try/catch riêng: history là tính năng phụ (biểu đồ trong app),
+  // còn `data` là thứ mọi bản app đang phát hành phụ thuộc vào. Một lỗi khi ghi history
+  // không được phép làm run này fail và kéo theo feed chính.
+  try {
+    const now = new Date();
+    const dayKey = vnDate(now);
+    const nowMs = now.getTime();
+    const wrote = [];
+
+    for (const [metal, items] of [
+      ["gold", mergedGold],
+      ["silver", mergedSilver],
+    ]) {
+      if (items.length === 0) continue;
+      if (await appendIntraday(metal, items, dayKey, nowMs)) wrote.push(`intraday:${metal}`);
+      if (await appendDaily(metal, items, dayKey)) wrote.push(`history:${metal}`);
+    }
+
+    console.log(wrote.length ? `History — wrote ${wrote.join(", ")}` : "History — nothing due, skipped");
+  } catch (err) {
+    console.error(`History write failed (feed itself is fine): ${err}`);
+  }
 }
 
 main().catch((err) => {
